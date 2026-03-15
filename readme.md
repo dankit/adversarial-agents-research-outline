@@ -10,7 +10,7 @@ The work is motivated by persistent disinformation campaigns across domains such
 
 Web signup and onboarding flows are among the most adversarial interactive environments available today: they combine non-stationary page layouts, multi-step verification gates, invisible behavioral scoring, and sophisticated fingerprinting — all designed to distinguish humans from automated agents. This makes them a compelling testbed for training robust, generalizable computer-use agents via reinforcement learning.
 
-This project trains a single LLM — Qwen 3.5-35B-A3B (MoE, 3B active parameters) — end-to-end to complete real web tasks by learning a policy that maps page observations to browser actions. The model is served locally via vLLM for development and inference, and trained on a cloud GH200 (96 GB HBM3) via QLoRA. The agent improves through a **prompted rollouts → supervised fine-tuning → GRPO reinforcement learning** pipeline, with reward signals derived from task completion, intermediate progress, and behavioral realism.
+This project trains a local LLM — Qwen 3.5-35B-A3B (MoE, 3B active parameters) — to complete real web tasks by learning a policy that maps page observations to browser actions. The model is served locally via vLLM for development and inference, and trained on a cloud GH200 (96 GB HBM3) via QLoRA. The agent improves through a **teacher demonstrations → supervised fine-tuning → GRPO reinforcement learning** pipeline, with reward signals derived from task completion, intermediate progress, and behavioral realism.
 
 ### What makes this technically interesting
 
@@ -50,9 +50,75 @@ This project trains a single LLM — Qwen 3.5-35B-A3B (MoE, 3B active parameters
 
 Three pillars:
 
-1. **Browser environment** — Playwright with real Chromium, exposing a Gym-style `reset()`/`step()` interface. The agent receives an observation (DOM accessibility tree or screenshot) and emits a discrete action.
-2. **Agent loop** — Observe → prompt LLM → parse structured action → execute in browser → collect (observation, action, reward) tuple.
+1. **Browser environment** (`browser_env/environment.py`) — Playwright with real Chromium, exposing a Gym-style `reset()`/`step()` interface. Creates a fresh browser context per episode (isolating cookies, storage, and state). The agent receives a DOM-text observation (interactive elements prioritized: form inputs > buttons > links, capped at 60 elements) and emits a discrete action.
+2. **Agent loop** (`agent/agent.py`) — Observe → prompt LLM → parse structured JSON action → execute in browser → collect (observation, action, reward) tuple. Includes universal recovery logic (stall detection, overlay escape, captcha back-off) but deliberately contains zero site-specific heuristics — all site knowledge lives in the task's `objective` and `form_data`.
 3. **RL trainer** — Collects N full trajectory rollouts, scores each with the shaped reward function, and applies GRPO-style group-relative advantage weighting to update the policy toward higher-reward trajectories. No critic network required (though per-step credit assignment is coarser as a result).
+
+### Design philosophy: prompt-driven, not heuristic-driven
+
+All site-specific knowledge lives in two places:
+1. **`objective`** — natural language description the LLM reads (what to click, what to avoid, what flow to follow)
+2. **`form_data`** — `dict[str, str]` injected into the system prompt so the LLM knows exactly what to type
+
+The agent code contains only **universal browser recovery** logic:
+- Stall detection (same URL + no reward for N steps) → `back()` / `goto(start)`
+- Pointer interception → `Escape` / restart
+- Captcha detection → `back()` / restart
+- No-elements fallback → `Tab`
+
+This means new sites need zero Python heuristic code — just a declarative task definition.
+
+---
+
+## Project Structure
+
+```
+rddt/
+├── docker-compose.yml              # vLLM model server (Qwen3.5-35B-A3B)
+├── .env.example                    # Environment variable template
+├── requirements.txt                # Core deps: playwright, openai, python-dotenv, pydantic
+├── README.md                       # Project-level docs, quick start, adding tasks
+├── AGENT_QUICKREF.md               # Operational reference: architecture, action contract, how to run
+├── PLAN.md                         # Full project plan: phases, RL design, bot detection, proxy/email setup
+│
+├── agent/                          # Agent loop and LLM integration
+│   ├── agent.py                    # Episode loop: observe → think → act → log; universal recovery
+│   ├── llm_client.py               # OpenAI-compatible vLLM client; think-tag stripping; tool call support
+│   └── prompts.py                  # build_system_prompt(objective, form_data) with observation format docs
+│
+├── browser_env/                    # Playwright browser environment
+│   ├── environment.py              # Gym-like reset/step API; observation extraction; action execution
+│   └── reward.py                   # Milestone-based reward shaping with per-field detection via form_data keys
+│
+├── tasks/                          # Declarative task definitions
+│   ├── base.py                     # WebTask base class (objective, form_data, success signals, captcha keywords)
+│   └── reddit_signup.py            # Reddit signup task (inherits WebTask)
+│
+├── training/                       # Trajectory collection and training pipeline
+│   ├── collect.py                  # Multi-episode trajectory collector with task registry
+│   ├── prepare_sft.py              # Filter heuristic actions, build SFT train/val splits from trajectories
+│   ├── sft.py                      # QLoRA fine-tuning with TRL SFTTrainer
+│   └── replay_artifacts.py         # Locate/open latest screenshots, videos, traces
+│
+├── platforms/                      # Platform-specific detection research
+│   ├── overview.md                 # Platform comparison, difficulty ranking, training strategy
+│   ├── reddit.md                   # Reddit detection stack and signup flow analysis
+│   ├── x_twitter.md                # X (Twitter) detection stack and signup flow analysis
+│   ├── linkedin.md                 # LinkedIn detection stack and signup flow analysis
+│   ├── verification_bypasses.md    # Phone/email verification bypass methods
+│   └── advanced_evasion.md         # Frontier lab evasion approaches (i.e. during webscraping)
+│
+├── trajectories/                   # Collected episode data (generated at runtime)
+│   ├── summary.csv                 # Episode-level metrics (reward, success, steps)
+│   └── <episode_id>.jsonl          # Per-episode transitions with task metadata header
+│
+└── artifacts/                      # Runtime artifacts (generated at runtime)
+    ├── screenshots/                # Per-step screenshots
+    ├── videos/                     # Playwright session videos
+    └── traces/                     # Per-episode Playwright traces (.zip)
+```
+
+Additionally, `datasets/` and `checkpoints/` are created by the SFT preparation and training scripts when those phases are run.
 
 ---
 
@@ -63,29 +129,51 @@ Three pillars:
 | Approach | Observation format | Model requirement | Tradeoff |
 |----------|-------------------|-------------------|----------|
 | **DOM / accessibility tree** (Phase 1–3) | Structured text: element roles, labels, IDs, input states | Text-only LLM (Qwen 3.5-35B-A3B) | Smaller observation space, faster RL iterations. More brittle across sites with different DOM structures. |
-| **Vision / screenshot** (Phase 4+) | Raw pixel image of the viewport | Vision-language model (Qwen2.5-VL-7B) | Generalizes better (buttons look like buttons). Handles canvas/WebGL UIs and obfuscated DOM. Higher compute cost per step. |
+| **Vision / screenshot** (Phase 4+) | Raw pixel image of the viewport | Vision-language model | Generalizes better (buttons look like buttons). Handles canvas/WebGL UIs and obfuscated DOM. Higher compute cost per step. |
 
 **Phase 1 uses DOM-text** because it works with the current text-only model and keeps observations compact, which matters when each RL training step requires N parallel rollouts through a real browser.
 
 The observation method does not affect bot-detection surface area — both approaches use Playwright driving a real Chromium instance. The detection surface is determined by the browser execution environment, not the agent's perception of it.
 
-### Action space
+### Observation format (implemented)
+
+```
+URL: https://www.reddit.com/register
+TITLE: Create Account
+ELEMENTS:
+- id=1 role=input type=email label=Email address filled=false enabled=true
+- id=2 role=input type=password label=Password filled=false enabled=true
+- id=3 role=button label=Sign Up filled=false enabled=true
+- id=4 role=a label=Already have an account? filled=false enabled=true
+```
+
+Elements are extracted via JavaScript, prioritized (form inputs first, then buttons, then links), and capped at 60 per observation. Each element is tagged with a stable `data-wa-oid` attribute on the page so the agent's `id=N` targets resolve deterministically to the correct DOM element.
+
+### Action space (implemented)
 
 ```python
 ACTIONS = [
-    "click(element_id)",     # DOM-mode: click by accessible element reference
-    "click(x, y)",           # vision-mode: click by pixel coordinate
-    "type(element_id, text)",
-    "scroll(direction)",     # up | down
-    "press(key)",            # Enter, Tab, Escape, etc.
-    "goto(url)",
-    "wait(seconds)",
-    "request_email_code",    # signals the Verification Oracle
-    "request_sms_code",      # signals the Verification Oracle
+    "click(target)",        # target is id=N from observation
+    "type(target, text)",   # target is id=N, types with human-like keystroke delays (60-180ms)
+    "press(key)",           # Enter, Tab, Escape, ArrowDown, ArrowUp
+    "wait(seconds)",        # max 8 seconds
+    "goto(url)",            # navigate to URL
+    "back()",               # browser back navigation
 ]
 ```
 
-Actions are emitted as structured text by the LLM and parsed deterministically. The action space is intentionally narrow — the agent must compose complex behaviors from primitive actions, which is where the RL signal provides value.
+### Planned additions (Phase 2+)
+
+```python
+FUTURE_ACTIONS = [
+    "click(x, y)",          # vision-mode: click by pixel coordinate (Phase 4+)
+    "scroll(direction)",    # up | down
+    "request_email_code",   # signals the Verification Oracle
+    "request_sms_code",     # signals the Verification Oracle
+]
+```
+
+Actions are emitted as structured JSON by the LLM and parsed deterministically. The agent first attempts tool-call mode (if supported by the model server), then falls back to JSON response format, then raw text extraction. On parse failure, the agent retries once with a stricter format prompt before falling back to `wait(1.0)`. The action space is intentionally narrow — the agent must compose complex behaviors from primitive actions, which is where the RL signal provides value.
 
 ---
 
@@ -96,7 +184,7 @@ Reward shaping is critical because the terminal signal (account created or not) 
 | Signal | Reward | Detection method |
 |--------|--------|------------------|
 | Reached signup form | +0.3 | URL pattern or DOM contains signup-specific elements |
-| Filled a field correctly | +0.1 per field | DOM state inspection after typing |
+| Filled a field correctly | +0.1 per field | DOM state inspection after typing (matched against `form_data` keys) |
 | Advanced to next step in flow | +0.1 | Step transition detected via URL or DOM change |
 | Completed verification | +0.15 | Verification input accepted |
 | **Account created successfully** | **+1.0** | Success page URL, confirmation text, or API check |
@@ -106,30 +194,55 @@ Reward shaping is critical because the terminal signal (account created or not) 
 | CAPTCHA triggered | −0.05 | CAPTCHA iframe/element detected in DOM |
 | Efficiency bonus | +0.2 × (1 − steps/max_steps) | Fewer steps = higher bonus |
 
+**Implementation note:** The reward tracker (`browser_env/reward.py`) currently implements the milestone-based subset: target page detection (+0.3), per-field fill detection via `form_data` keys (+0.1 each), CAPTCHA penalty (−0.05), and success bonus (+1.0). The behavioral penalties (timing, click centering, efficiency) are designed for Phase 3 RL and will be added when the GRPO training loop is built.
+
 **Design rationale:** Negative rewards for bot-like micro-behaviors incentivize the policy to learn human-plausible interaction patterns — not as hardcoded heuristics, but as emergent behavior shaped by the reward landscape. The agent should discover that browsing before signing up reduces CAPTCHA frequency, that variable typing speed avoids keystroke analysis flags, and that non-centered clicks avoid heatmap detection — all through trial-and-error RL.
 
 ---
 
 ## Training Pipeline
 
-### Phase 1 — Prompted rollouts (no weight updates)
+### Training strategy
 
-Run the pre-trained Qwen 3.5-35B-A3B as a zero-shot agent. The model receives the DOM observation and a system prompt describing the action format. Trajectories (successful and failed) are logged as (observation, action, reward) sequences.
+The pipeline has three phases. The current approach uses **same-family distillation** for demonstration collection:
+
+**Teacher model selection:** Same-family distillation works best — the teacher and student share the same tokenizer and reasoning style, so demonstrations transfer more cleanly.
+
+| Teacher | Active params | VRAM (int4) | Notes |
+|---|---|---|---|
+| **Qwen3.5-122B-A10B** | 10B | ~61 GB — fits 1x H100 80 GB | Best practical choice: strong enough for quality demos, serveable on a single GPU |
+| Qwen3.5-397B-A17B | 17B | ~199 GB — needs 3+ GPUs | Stronger but much harder to serve; diminishing returns for behavioral cloning |
+
+Prefer **Qwen3.5-122B-A10B** — it's the sweet spot between demonstration quality and serving cost. The student only sees actions, not logits, so the marginal quality gain from 397B rarely justifies 3x the hardware.
+
+To collect, serve the teacher via vLLM and point `OPENAI_BASE_URL` at it during the collection phase, then switch back to the student model for SFT and self-play.
+
+### Phase 1 — Demonstration collection (implemented)
+
+Collect trajectories using a teacher model. The model receives the DOM observation, task objective, form data, and recent action history via a system prompt describing the action format. Trajectories (successful and failed) are logged as JSONL files with per-step (observation, action, reward) transitions and a metadata header containing the objective and form data.
+
+The trajectory collector (`training/collect.py`) supports:
+- Multi-episode batch collection with configurable step limits
+- Watch mode (headed browser with slow-motion for debugging)
+- Per-step screenshots, video recording, and Playwright trace capture
+- Summary CSV with episode-level metrics (reward, success, steps)
+- Task registry for easy extension to new sites
 
 **Purpose:** Establish baseline performance, collect seed trajectories for SFT, and iterate on prompt engineering + environment instrumentation.
 
-### Phase 2 — Supervised fine-tuning (SFT)
+### Phase 2 — Supervised fine-tuning (SFT) (implemented)
 
-Filter Phase 1 trajectories to successful completions. Format as multi-turn conversations: each turn is an (observation, action) pair, preserving the full sequential structure. Fine-tune **the same Qwen 3.5-35B-A3B** with QLoRA on a cloud GH200 using `trl.SFTTrainer`.
+Filter Phase 1 trajectories to successful completions. The SFT preparation script (`training/prepare_sft.py`) reads task metadata (objective, form_data) from each trajectory JSONL so SFT prompts include the same form data the agent saw during collection. It filters out heuristic/recovery actions by default (training only on genuine model decisions), then formats as multi-turn conversations and splits into train/val sets.
 
-| Setup | Model weights | QLoRA training overhead | Total VRAM | Hardware |
-|-------|--------------|------------------------|------------|----------|
-| **Primary (cloud)** | ~17.5 GB (4-bit) | ~15–20 GB | **~35–40 GB** | GH200 96 GB HBM3 |
-| Fallback (local) | ~7–15 GB | ~3–5 GB | ~10–20 GB | Consumer GPU (Qwen2.5-7B/3B) |
-
-**Training the same model you inference with** eliminates the two hardest problems in the previous distillation-based approach: (a) no distribution mismatch — the model collecting trajectories IS the model being trained, so there is no DAgger-style compounding error from behavioral cloning; (b) no capability ceiling — the 35B MoE retains its full reasoning capacity for planning multi-step actions over complex DOM structures.
+Fine-tune **Qwen 3.5-35B-A3B** with QLoRA on a cloud GH200 using `trl.SFTTrainer`:
 
 SFT provides a warm-start policy that succeeds more often than prompting alone, producing richer training signal for RL.
+
+**SFT data quality controls:**
+- Heuristic/recovery actions filtered out by default (only clean model decisions)
+- Parse-error fallback actions excluded
+- Train/val split with configurable ratio
+- Per-step metadata preserved for analysis
 
 ### Phase 3 — RL fine-tuning (trajectory-level GRPO)
 
@@ -180,7 +293,7 @@ def grpo_training_step(policy, env, task, N=8):
     policy.update(train_batch)  # weighted policy gradient step
 ```
 
-**Why trajectory-level GRPO instead of PPO:** PPO's per-step value function provides finer-grained credit assignment, which is generally preferable for multi-step tasks. However, it requires fitting a critic network — for a 35B MoE model, even a smaller critic adds significant VRAM pressure alongside the policy, QLoRA optimizer states, and KV cache on a single GH200. Trajectory-level GRPO avoids the critic entirely. The shaped reward function (intermediate progress signals at each step) partially compensates for coarser credit assignment: even though the trajectory-level advantage is shared across all steps, each (observation, action) training pair individually carries step-level signal about what worked. PPO with a learned critic remains a planned upgrade if multi-GPU training becomes available.
+**Why trajectory-level GRPO instead of PPO:** PPO's per-step value function provides finer-grained credit assignment, which is generally preferable for multi-step tasks. However, it requires fitting a critic network — for a 35B MoE model, even a smaller critic adds significant VRAM pressure alongside the policy, QLoRA optimizer states, and KV cache on a single GH200. Trajectory-level GRPO avoids the critic entirely. The shaped reward function (intermediate progress signals at each step) partially compensates for coarser credit assignment: even though the trajectory-level advantage is shared across all steps, each (observation, action) training pair individually carries step-level signal about what worked. PPO with a learned critic remains a planned upgrade if multi-GPU training becomes a necessity.
 
 **Why not vanilla `trl.GRPOTrainer`:** The standard API assumes a static prompt with N sampled completions. In an interactive environment, the "prompt" (observation) changes after every action, so rollouts must be collected externally. `veRL` (ByteDance) and `OpenRLHF` are designed for LLM RL with environment interaction and are candidates for replacing the custom training loop as the project matures.
 
@@ -189,6 +302,78 @@ def grpo_training_step(policy, env, task, N=8):
 ### Phase 4 — Cross-task generalization
 
 Train on multiple platforms with random task sampling per episode. Evaluate on held-out sites the model has never seen. The hypothesis: a policy trained on diverse adversarial signup flows should generalize to novel flows better than one memorizing a single site's DOM structure.
+
+---
+
+## Quick Start
+
+```powershell
+# 1. Install
+python -m venv .venv && .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt && playwright install chromium
+
+# 2. Configure
+copy .env.example .env   # edit HF_TOKEN, TENSOR_PARALLEL_SIZE, proxy settings
+
+# 3. Start model server
+docker compose up -d
+docker compose logs -f qwen   # wait for "Uvicorn running on ..."
+
+# 4. Collect trajectories
+python -m training.collect --task reddit_signup --episodes 5 --max-steps 40
+python -m training.collect --task reddit_signup --episodes 1 --watch --verbose-actions  # visible browser
+
+# 5. Prepare SFT data (reads objective + form_data from trajectory metadata)
+python -m training.prepare_sft --success-only
+
+# 6. Fine-tune
+pip install trl transformers datasets accelerate peft bitsandbytes
+python -m training.sft --dataset datasets/sft_turns_train.jsonl --output-dir checkpoints/sft
+```
+
+Outputs: `trajectories/*.jsonl`, `trajectories/summary.csv`, `artifacts/{screenshots,videos,traces}/`, `datasets/sft_turns_{train,val}.jsonl`.
+
+### Remote GPU Setup
+
+```powershell
+# SSH tunnel from local machine to remote model server
+ssh -L 8000:localhost:8000 ubuntu@<REMOTE_IP>
+# If port 8000 is busy locally, use 8001 and set OPENAI_BASE_URL=http://localhost:8001/v1
+```
+
+---
+
+## Adding a New Task
+
+```python
+# tasks/my_task.py
+from dataclasses import dataclass, field
+from tasks.base import WebTask
+
+@dataclass
+class MyTask(WebTask):
+    start_url: str = "https://example.com"
+    objective: str = (
+        "Create an account on example.com using email. "
+        "Fill fields with the provided form data and submit. "
+        "Avoid phone verification and social login."
+    )
+    form_data: dict[str, str] = field(default_factory=lambda: {
+        "email": "test@example.com",
+        "password": "SecurePass123!",
+    })
+    success_url_must_contain: list[str] = field(default_factory=lambda: ["example.com"])
+    success_url_must_not_contain: list[str] = field(default_factory=lambda: ["/signup"])
+    success_obs_any_of: list[str] = field(default_factory=lambda: ["welcome", "dashboard"])
+```
+
+Register in `training/collect.py` and run:
+
+```powershell
+python -m training.collect --task my_task --episodes 5
+```
+
+No heuristic code needed — the LLM reads the objective and form_data.
 
 ---
 
@@ -226,6 +411,20 @@ The agent operates against a layered detection stack. Understanding these layers
 ### Design implication
 
 The browser environment wrapper handles infrastructure-level concerns (stealth patches, proxy routing, WebRTC policy, fingerprint consistency). The RL policy learns higher-level behavioral patterns: browsing before high-risk actions, realistic timing, natural interaction cadence. The separation is deliberate — low-level countermeasures are deterministic infrastructure; high-level behavioral patterns are learned.
+
+---
+
+## Platform Research
+
+Detailed detection stack analysis and signup flow documentation is maintained in the `platforms/` directory:
+
+| Platform | Difficulty | Primary obstacle | CAPTCHA | Phone required |
+|----------|-----------|-----------------|---------|----------------|
+| Reddit | Medium | reCAPTCHA (avoidable with warm sessions) | reCAPTCHA v2 (risk-based) | Rarely |
+| X | Hard | Arkose Labs (almost always triggered) | Arkose FunCaptcha | Increasingly yes |
+| LinkedIn | Hard+ | Arkose + device fingerprinting + post-signup monitoring | Arkose FunCaptcha (risk-based) | Risk-based, can escalate to ID verification |
+
+**Recommended training order:** Reddit (basic web nav, form filling) → X (multi-step modals, CAPTCHA oracle, email verification) → LinkedIn (complex multi-page flows, geographic consistency, post-signup onboarding).
 
 ---
 
@@ -286,14 +485,39 @@ The project follows a progressive fidelity ladder, where each tier increases the
 
 ## Infrastructure
 
-- **Model serving (local):** Qwen 3.5-35B-A3B via vLLM (OpenAI-compatible API, `localhost:8000`), Docker Compose with NVIDIA GPU passthrough. Used for development, prompt iteration, and local inference (~20 GB VRAM).
+- **Model serving (local):** Qwen 3.5-35B-A3B via vLLM (OpenAI-compatible API, `localhost:8000`), Docker Compose with NVIDIA GPU passthrough. Used for development, prompt iteration, and local inference (~20 GB VRAM). Configurable via `.env` (model, dtype, GPU utilization, tensor parallelism, max model length).
 - **Training compute (cloud):** NVIDIA GH200 (96 GB HBM3) on Lambda Labs. QLoRA fine-tuning of the full 35B MoE model fits in ~35–40 GB, leaving headroom for batch size and sequence length. Rollout collection and training alternate on the same GPU.
-- **Browser automation:** Playwright + Chromium with stealth patches, residential proxy with sticky sessions. Runs on a lightweight CPU instance or locally — does not require GPU.
-- **Training stack:** `trl` (SFTTrainer), `peft` (QLoRA), `transformers`, `accelerate`; custom trajectory-level GRPO training loop (candidates for replacement: `veRL`, `OpenRLHF`)
+- **Browser automation:** Playwright + Chromium with WebRTC leak prevention (`--force-webrtc-ip-handling-policy=disable_non_proxied_udp`), residential proxy with sticky sessions (configurable via env vars). Creates fresh browser context per episode for state isolation. Runs on a lightweight CPU instance or locally — does not require GPU.
+- **Training stack:** `trl` (SFTTrainer), `peft` (QLoRA with 4-bit NF4 quantization), `transformers`, `accelerate`, `bitsandbytes`; custom trajectory-level GRPO training loop (candidates for replacement: `veRL`, `OpenRLHF`).
+- **Core dependencies:** `playwright`, `openai` (Python client), `python-dotenv`, `pydantic`. Phase 2 deps (trl, transformers, etc.) installed separately.
 - **Cost estimate:** GH200 on Lambda ≈ $2–3/hr. SFT (a few hours) + RL (tens of hours over multiple sessions) ≈ $50–150 total training compute.
+
+### Model serving notes
+
+- `MAX_MODEL_LEN=32768` (reduce if VRAM-constrained)
+- `GPU_MEMORY_UTILIZATION=0.95` (lower if sharing GPU)
+- `TENSOR_PARALLEL_SIZE` = number of GPUs
+- Tool calling: `--enable-auto-tool-choice --tool-call-parser hermes`
+
+### Prerequisites
+
+- NVIDIA GPU (GH200 / A100 / H100 recommended), Docker with GPU support
+- Python 3.11+, Hugging Face token with model access
 
 ---
 
 ## Current Status
 
-The vLLM serving infrastructure is operational. Platform-specific research (detection stacks, DOM structures, verification flows) is complete for most major sites. The immediate next step is building the browser environment wrapper and agent loop (Phase 1), collecting trajectories, and iterating toward the SFT and GRPO training phases.
+Phase 1 (demonstration collection) is **implemented and operational**:
+- The vLLM serving infrastructure is running via Docker Compose.
+- The browser environment wrapper exposes a Gym-style `reset()`/`step()` API with DOM-text observations.
+- The agent loop collects trajectories with universal recovery logic and no site-specific heuristics.
+- The declarative task system supports Reddit signup; new platforms are added by subclassing `WebTask`.
+- Trajectory collection produces JSONL files with task metadata headers and a summary CSV.
+- Platform-specific research (detection stacks, DOM structures, verification flows) is complete for Reddit, X, LinkedIn, etc.
+
+Phase 2 (SFT) tooling is **implemented**:
+- SFT data preparation filters heuristic actions, reads task metadata from trajectories, and builds train/val splits.
+- QLoRA fine-tuning script uses TRL SFTTrainer with configurable LoRA rank/alpha and 4-bit quantization.
+
+**Immediate next steps:** Collect a sufficient corpus of successful trajectories for SFT warm-start, run SFT on a cloud GH200, and begin iterating toward the GRPO training phase.
