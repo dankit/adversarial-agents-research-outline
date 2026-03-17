@@ -116,10 +116,6 @@ root/
     └── traces/                     # Per-episode Playwright traces (.zip)
 ```
 
-Additionally, `datasets/` and `checkpoints/` are created by the SFT preparation and training scripts when those phases are run. `.cursor/rules/` contains persistent AI agent rules that ensure future Cursor sessions know about the eval conventions and project architecture.
-
----
-
 ## Observation and Action Design
 
 ### Observation strategy
@@ -335,45 +331,10 @@ python -m evals.run --output-json evals_report.json
 python -m training.prepare_sft --success-only
 
 # 9. Fine-tune (on remote GPU)
-pip install trl transformers datasets accelerate peft bitsandbytes
 python -m training.sft --dataset datasets/sft_turns_train.jsonl --output-dir checkpoints/sft
 ```
 
 Outputs: `trajectories/*.jsonl`, `trajectories/summary.csv`, `artifacts/{screenshots,videos,traces}/`, `datasets/sft_turns_{train,val}.jsonl`.
-
----
-
-## Adding a New Task
-
-```python
-# tasks/my_task.py
-from dataclasses import dataclass, field
-from tasks.base import WebTask
-
-@dataclass
-class MyTask(WebTask):
-    start_url: str = "https://example.com"
-    objective: str = (
-        "Create an account on example.com using email. "
-        "Fill fields with the provided form data and submit. "
-        "Avoid phone verification and social login."
-    )
-    form_data: dict[str, str] = field(default_factory=lambda: {
-        "email": "test@example.com",
-        "password": "SecurePass123!",
-    })
-    success_url_must_contain: list[str] = field(default_factory=lambda: ["example.com"])
-    success_url_must_not_contain: list[str] = field(default_factory=lambda: ["/signup"])
-    success_obs_any_of: list[str] = field(default_factory=lambda: ["welcome", "dashboard"])
-```
-
-Register in `training/collect.py` and run:
-
-```powershell
-python -m training.collect --task my_task --episodes 5
-```
-
-No heuristic code needed — the LLM reads the objective and form_data.
 
 ---
 
@@ -414,12 +375,6 @@ The browser environment wrapper handles infrastructure-level concerns (stealth p
 
 ---
 
-## Platform Research
-
-**Recommended training order:** basic web nav, form filling → multi-step modals, CAPTCHA oracle, email verification → complex multi-page flows, geographic consistency, post-signup onboarding.
-
----
-
 ## Environment Authenticity Progression
 
 The project follows a progressive fidelity ladder, where each tier increases the realism of the execution environment:
@@ -449,11 +404,6 @@ The project follows a progressive fidelity ladder, where each tier increases the
 - **Training stack:** `trl` (SFTTrainer), `peft` (QLoRA — 4-bit NF4 quantization via `unsloth` + LoRA adapters), `transformers`, `accelerate`; custom trajectory-level GRPO training loop (candidates for replacement: `veRL`, `OpenRLHF`).
 - **Core dependencies:** `playwright`, `openai` (Python client), `python-dotenv`, `pydantic`. Phase 2 deps (trl, transformers, etc.) installed separately.
 - **Cost estimate:** GH200 on Lambda ≈ $2–3/hr. SFT (a few hours) + RL (tens of hours over multiple sessions) ≈ $50–150 total training compute.
-
-### Prerequisites
-
-- Remote NVIDIA GPU (GH200 / A100 / H100) with Docker and GPU support, accessible via SSH
-- Local machine: Python 3.11+, Hugging Face token with model access
 
 ---
 
