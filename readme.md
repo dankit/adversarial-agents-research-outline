@@ -73,7 +73,7 @@ This means new sites need zero Python heuristic code — just a declarative task
 ## Project Structure
 
 ```
-rddt/
+root/
 ├── docker-compose.yml              # vLLM model server (Qwen3.5-35B-A3B)
 ├── .env.example                    # Environment variable template
 ├── requirements.txt                # Core deps: playwright, openai, python-dotenv, pydantic
@@ -92,7 +92,7 @@ rddt/
 │
 ├── tasks/                          # Declarative task definitions
 │   ├── base.py                     # WebTask base class (objective, form_data, success signals, captcha keywords)
-│   └── reddit_signup.py            # Reddit signup task (inherits WebTask)
+│   └── example_signup.py           # example signup task for website A (inherits WebTask)
 │
 ├── training/                       # Trajectory collection and training pipeline
 │   ├── collect.py                  # Multi-episode trajectory collector with task registry
@@ -105,14 +105,6 @@ rddt/
 │   ├── criteria.py                 # 10 LLM-as-judge criteria with 1-5 rubrics
 │   ├── judge.py                    # LLM-as-judge trajectory scoring (summarizes + prompts judge model)
 │   └── run.py                      # CLI: python -m evals.run (patterns-only or full judge)
-│
-├── platforms/                      # Platform-specific detection research
-│   ├── overview.md                 # Platform comparison, difficulty ranking, training strategy
-│   ├── reddit.md                   # Reddit detection stack and signup flow analysis
-│   ├── x_twitter.md                # X (Twitter) detection stack and signup flow analysis
-│   ├── linkedin.md                 # LinkedIn detection stack and signup flow analysis
-│   ├── verification_bypasses.md    # Phone/email verification bypass methods
-│   └── advanced_evasion.md         # Frontier lab evasion approaches (i.e. during webscraping)
 │
 ├── trajectories/                   # Collected episode data (generated at runtime)
 │   ├── summary.csv                 # Episode-level metrics (reward, success, steps)
@@ -144,7 +136,7 @@ The observation method does not affect bot-detection surface area — both appro
 ### Observation format (implemented)
 
 ```
-URL: https://www.reddit.com/register
+URL: https://www.example.com/register
 TITLE: Create Account
 ELEMENTS:
 - id=1 role=input type=email label=Email address filled=false enabled=true
@@ -330,8 +322,8 @@ docker compose up -d
 docker compose logs -f qwen   # wait for "Uvicorn running on ..."
 
 # 5. Collect trajectories (local machine, browser runs locally)
-python -m training.collect --task reddit_signup --episodes 5 --max-steps 40
-python -m training.collect --task reddit_signup --episodes 1 --watch --verbose-actions  # visible browser
+python -m training.collect --task website_signup --episodes 5 --max-steps 40
+python -m training.collect --task website_signup --episodes 1 --watch --verbose-actions  # visible browser
 
 # 6. Evaluate collected trajectories (instant, no LLM needed)
 python -m evals.run --patterns-only
@@ -424,36 +416,7 @@ The browser environment wrapper handles infrastructure-level concerns (stealth p
 
 ## Platform Research
 
-Detailed detection stack analysis and signup flow documentation is maintained in the `platforms/` directory:
-
-| Platform | Difficulty | Primary obstacle | CAPTCHA | Phone required |
-|----------|-----------|-----------------|---------|----------------|
-| Reddit | Medium | reCAPTCHA (avoidable with warm sessions) | reCAPTCHA v2 (risk-based) | Rarely |
-| X | Hard | Arkose Labs (almost always triggered) | Arkose FunCaptcha | Increasingly yes |
-| LinkedIn | Hard+ | Arkose + device fingerprinting + post-signup monitoring | Arkose FunCaptcha (risk-based) | Risk-based, can escalate to ID verification |
-
-**Recommended training order:** Reddit (basic web nav, form filling) → X (multi-step modals, CAPTCHA oracle, email verification) → LinkedIn (complex multi-page flows, geographic consistency, post-signup onboarding).
-
----
-
-## Verification Oracle Abstraction
-
-Verification (email codes, SMS codes) is separated from the agent's policy as an **environment oracle**:
-
-```
-Agent                              Environment
-  │                                     │
-  │──── request_email_code ────────────▶│
-  │                                     │──▶ VerificationOracle
-  │                                     │       polls IMAP inbox
-  │◀──── observation: code = "482901" ──│◀── returns code
-  │                                     │
-  │──── type(code_field, "482901") ────▶│
-```
-
-The agent learns *when* to request a code (recognizing the "enter code" input in the DOM) and *how* to enter it, but the logistics of email/SMS retrieval are deterministic infrastructure — not a learned skill. This keeps the RL signal focused on web interaction policy.
-
-Full methodology on verification bypass is not disclosed to prevent abuse. If interested feel free to ask, I have some interesting, novel ideas.
+**Recommended training order:** basic web nav, form filling → multi-step modals, CAPTCHA oracle, email verification → complex multi-page flows, geographic consistency, post-signup onboarding.
 
 ---
 
@@ -477,20 +440,6 @@ The project follows a progressive fidelity ladder, where each tier increases the
 
 ---
 
-## Related Work and Positioning
-
-| Project | Approach | Difference from this work |
-|---------|----------|--------------------------|
-| **AgentQ** (MultiOn, 2024) | MCTS + DPO for web agents | Uses search-time compute (MCTS) for planning + offline preference learning (DPO). This project uses online RL with trajectory-level GRPO against a live adversarial environment, where reward includes behavioral quality — not just task completion. |
-| **DigiRL** (2024) | RL for device control | Operates on mobile device emulators with vision; this project starts with DOM-text on real websites with active anti-automation. |
-| **BrowserGym** (ServiceNow) | Gym-compatible browser environment | Provides the environment abstraction; this project builds a similar wrapper but adds adversarial dynamics (detection, challenges, verification gates). |
-| **WebAgent** (Google, 2023) | HTML-understanding web agent | Supervised/prompted; no RL fine-tuning against live adversarial feedback. |
-| **OpenHands** (formerly OpenDevin) | General computer-use agent | Broad scope; not specialized for adversarial web environments or RL training. |
-
-**This project's contribution:** Combining online RL (trajectory-level GRPO) with a real, adversarial web environment where the reward function explicitly encodes both task completion and behavioral realism. The agent learns not just *what* to do, but *how* to act in a way that preserves trust signals — an objective that doesn't exist in standard web agent benchmarks. The training methodology handles the unique constraints of this setting: expensive exploration (each episode costs real resources), non-stationarity (the environment adapts), and the absence of a simulator (no cheap resets).
-
----
-
 ## Infrastructure
 
 - **Model serving (remote via SSH tunnel):** Qwen 3.5-35B-A3B served via vLLM in Docker on a remote cloud GPU. The local machine connects via SSH tunnel (`ssh -L 8000:localhost:8000 ubuntu@<REMOTE_IP>`), so the OpenAI-compatible API appears at `localhost:8000` locally. The model runs in bfloat16 — no quantization at inference time. Configurable via `.env` (model, dtype, GPU utilization, tensor parallelism, max model length).
@@ -500,16 +449,6 @@ The project follows a progressive fidelity ladder, where each tier increases the
 - **Training stack:** `trl` (SFTTrainer), `peft` (QLoRA — 4-bit NF4 quantization via `unsloth` + LoRA adapters), `transformers`, `accelerate`; custom trajectory-level GRPO training loop (candidates for replacement: `veRL`, `OpenRLHF`).
 - **Core dependencies:** `playwright`, `openai` (Python client), `python-dotenv`, `pydantic`. Phase 2 deps (trl, transformers, etc.) installed separately.
 - **Cost estimate:** GH200 on Lambda ≈ $2–3/hr. SFT (a few hours) + RL (tens of hours over multiple sessions) ≈ $50–150 total training compute.
-
-### Model serving notes
-
-- Model runs in `bfloat16` on Ampere+ GPUs (no quantization at inference)
-- `MAX_MODEL_LEN=32768` (reduce if VRAM-constrained)
-- `GPU_MEMORY_UTILIZATION=0.92` (lower if sharing GPU)
-- `TENSOR_PARALLEL_SIZE` = number of GPUs
-- Reasoning: `--reasoning-parser qwen3`
-- Tool calling: `--enable-auto-tool-choice --tool-call-parser qwen3_coder`
-- `--language-model-only` (multi-modal model served as language model, allows for bringing in vision later with less overhead)
 
 ### Prerequisites
 
@@ -524,9 +463,9 @@ Phase 1 (demonstration collection) is **implemented and operational**:
 - The vLLM serving infrastructure runs via Docker Compose on a remote cloud GPU, accessed locally via SSH tunnel.
 - The browser environment wrapper exposes a Gym-style `reset()`/`step()` API with DOM-text observations.
 - The agent loop collects trajectories with universal recovery logic and no site-specific heuristics.
-- The declarative task system supports Reddit signup; new platforms are added by subclassing `WebTask`.
+- The declarative task system supports a simple web signup; new platforms are added by subclassing `WebTask`.
 - Trajectory collection produces JSONL files with task metadata headers and a summary CSV.
-- Platform-specific research (detection stacks, DOM structures, verification flows) is complete for Reddit, X, LinkedIn, etc.
+- Platform-specific research (detection stacks, DOM structures, verification flows) is complete.
 
 **Trajectory evaluation is implemented:**
 - 12 deterministic failure pattern detectors (action loops, wait cascades, parse error spikes, observation-unchanged stalls, etc.) for instant, zero-cost trajectory triage.
