@@ -10,7 +10,7 @@ The work is motivated by persistent disinformation campaigns across domains such
 
 Web signup and onboarding flows are among the most adversarial interactive environments available today: they combine non-stationary page layouts, multi-step verification gates, invisible behavioral scoring, and sophisticated fingerprinting — all designed to distinguish humans from automated agents. This makes them a compelling testbed for training robust, generalizable computer-use agents via reinforcement learning.
 
-This project trains a local LLM — Qwen 3.5-35B-A3B (MoE, 3B active parameters) — to complete real web tasks by learning a policy that maps page observations to browser actions. The model is served locally via vLLM for development and inference, and trained on a cloud GH200 (96 GB HBM3) via QLoRA. The agent improves through a **teacher demonstrations → supervised fine-tuning → GRPO reinforcement learning** pipeline, with reward signals derived from task completion, intermediate progress, and behavioral realism.
+This project trains an LLM — Qwen 3.5-35B-A3B (MoE, 3B active parameters) — to complete real web tasks by learning a policy that maps page observations to browser actions. The model is served via vLLM on a remote cloud GPU (accessed locally through an SSH tunnel to `localhost:8000`), and fine-tuned on the same hardware via QLoRA. A stronger same-family teacher model (Qwen3.5-122B-A10B) generates seed demonstrations, and an LLM-as-judge (most likely going to be gpt or claude) evaluation system scores trajectory quality. The agent improves through a **teacher demonstrations → supervised fine-tuning → GRPO reinforcement learning** pipeline, with reward signals derived from task completion, intermediate progress, and behavioral realism.
 
 ### What makes this technically interesting
 
@@ -100,6 +100,12 @@ rddt/
 │   ├── sft.py                      # QLoRA fine-tuning with TRL SFTTrainer
 │   └── replay_artifacts.py         # Locate/open latest screenshots, videos, traces
 │
+├── evals/                          # Two-layer trajectory evaluation system
+│   ├── patterns.py                 # 12 deterministic failure pattern detectors (instant, zero LLM cost)
+│   ├── criteria.py                 # 10 LLM-as-judge criteria with 1-5 rubrics
+│   ├── judge.py                    # LLM-as-judge trajectory scoring (summarizes + prompts judge model)
+│   └── run.py                      # CLI: python -m evals.run (patterns-only or full judge)
+│
 ├── platforms/                      # Platform-specific detection research
 │   ├── overview.md                 # Platform comparison, difficulty ranking, training strategy
 │   ├── reddit.md                   # Reddit detection stack and signup flow analysis
@@ -118,7 +124,7 @@ rddt/
     └── traces/                     # Per-episode Playwright traces (.zip)
 ```
 
-Additionally, `datasets/` and `checkpoints/` are created by the SFT preparation and training scripts when those phases are run.
+Additionally, `datasets/` and `checkpoints/` are created by the SFT preparation and training scripts when those phases are run. `.cursor/rules/` contains persistent AI agent rules that ensure future Cursor sessions know about the eval conventions and project architecture.
 
 ---
 
@@ -208,14 +214,14 @@ The pipeline has three phases. The current approach uses **same-family distillat
 
 **Teacher model selection:** Same-family distillation works best — the teacher and student share the same tokenizer and reasoning style, so demonstrations transfer more cleanly.
 
-| Teacher | Active params | VRAM (int4) | Notes |
+| Teacher | Active params | VRAM (bf16 -> Q4) | Notes |
 |---|---|---|---|
-| **Qwen3.5-122B-A10B** | 10B | ~61 GB — fits 1x H100 80 GB | Best practical choice: strong enough for quality demos, serveable on a single GPU |
-| Qwen3.5-397B-A17B | 17B | ~199 GB — needs 3+ GPUs | Stronger but much harder to serve; diminishing returns for behavioral cloning |
+| **Qwen3.5-122B-A10B** | 10B | fits on 1x H100 80 GB or 1x GH200 (96 GB HBM3) | Best practical choice: strong enough for quality demos, serveable on a single GPU, concerns around context length |
+| Qwen3.5-397B-A17B | 17B | 100GB+ — needs multiple GPUs | Stronger but much harder to serve; diminishing returns for behavioral cloning |
 
 Prefer **Qwen3.5-122B-A10B** — it's the sweet spot between demonstration quality and serving cost. The student only sees actions, not logits, so the marginal quality gain from 397B rarely justifies 3x the hardware.
 
-To collect, serve the teacher via vLLM and point `OPENAI_BASE_URL` at it during the collection phase, then switch back to the student model for SFT and self-play.
+To collect, serve the teacher via vLLM on the remote GPU and point `OPENAI_BASE_URL` at it (via SSH tunnel) during the collection phase, then switch back to the student model for SFT and self-play.
 
 ### Phase 1 — Demonstration collection (implemented)
 
@@ -234,7 +240,7 @@ The trajectory collector (`training/collect.py`) supports:
 
 Filter Phase 1 trajectories to successful completions. The SFT preparation script (`training/prepare_sft.py`) reads task metadata (objective, form_data) from each trajectory JSONL so SFT prompts include the same form data the agent saw during collection. It filters out heuristic/recovery actions by default (training only on genuine model decisions), then formats as multi-turn conversations and splits into train/val sets.
 
-Fine-tune **Qwen 3.5-35B-A3B** with QLoRA on a cloud GH200 using `trl.SFTTrainer`:
+Fine-tune **Qwen 3.5-35B-A3B** with LoRA on the remote GPU using `trl.SFTTrainer`:
 
 SFT provides a warm-start policy that succeeds more often than prompting alone, producing richer training signal for RL.
 
@@ -293,7 +299,7 @@ def grpo_training_step(policy, env, task, N=8):
     policy.update(train_batch)  # weighted policy gradient step
 ```
 
-**Why trajectory-level GRPO instead of PPO:** PPO's per-step value function provides finer-grained credit assignment, which is generally preferable for multi-step tasks. However, it requires fitting a critic network — for a 35B MoE model, even a smaller critic adds significant VRAM pressure alongside the policy, QLoRA optimizer states, and KV cache on a single GH200. Trajectory-level GRPO avoids the critic entirely. The shaped reward function (intermediate progress signals at each step) partially compensates for coarser credit assignment: even though the trajectory-level advantage is shared across all steps, each (observation, action) training pair individually carries step-level signal about what worked. PPO with a learned critic remains a planned upgrade if multi-GPU training becomes a necessity.
+**Why trajectory-level GRPO instead of PPO:** PPO's per-step value function provides finer-grained credit assignment, which is generally preferable for multi-step tasks. However, it requires fitting a critic network — for a 35B MoE model, even a smaller critic adds significant VRAM pressure alongside the policy weights, LoRA optimizer states, and KV cache on a single GPU. Trajectory-level GRPO avoids the critic entirely. The shaped reward function (intermediate progress signals at each step) partially compensates for coarser credit assignment: even though the trajectory-level advantage is shared across all steps, each (observation, action) training pair individually carries step-level signal about what worked. PPO with a learned critic remains a potential upgrade if multi-GPU training becomes a necessity and if I am not prohibited by pricing.
 
 **Why not vanilla `trl.GRPOTrainer`:** The standard API assumes a static prompt with N sampled completions. In an interactive environment, the "prompt" (observation) changes after every action, so rollouts must be collected externally. `veRL` (ByteDance) and `OpenRLHF` are designed for LLM RL with environment interaction and are candidates for replacing the custom training loop as the project matures.
 
@@ -308,38 +314,40 @@ Train on multiple platforms with random task sampling per episode. Evaluate on h
 ## Quick Start
 
 ```powershell
-# 1. Install
+# 1. Install (local machine)
 python -m venv .venv && .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt && playwright install chromium
 
 # 2. Configure
 copy .env.example .env   # edit HF_TOKEN, TENSOR_PARALLEL_SIZE, proxy settings
 
-# 3. Start model server
+# 3. SSH tunnel to remote model server (separate terminal)
+ssh -L 8000:localhost:8000 ubuntu@<REMOTE_IP>
+# If port 8000 is busy locally, use 8001 and set OPENAI_BASE_URL=http://localhost:8001/v1
+
+# 4. Start model server (on remote GPU machine)
 docker compose up -d
 docker compose logs -f qwen   # wait for "Uvicorn running on ..."
 
-# 4. Collect trajectories
+# 5. Collect trajectories (local machine, browser runs locally)
 python -m training.collect --task reddit_signup --episodes 5 --max-steps 40
 python -m training.collect --task reddit_signup --episodes 1 --watch --verbose-actions  # visible browser
 
-# 5. Prepare SFT data (reads objective + form_data from trajectory metadata)
+# 6. Evaluate collected trajectories (instant, no LLM needed)
+python -m evals.run --patterns-only
+
+# 7. Full eval with LLM-as-judge
+python -m evals.run --output-json evals_report.json
+
+# 8. Prepare SFT data (reads objective + form_data from trajectory metadata)
 python -m training.prepare_sft --success-only
 
-# 6. Fine-tune
+# 9. Fine-tune (on remote GPU)
 pip install trl transformers datasets accelerate peft bitsandbytes
 python -m training.sft --dataset datasets/sft_turns_train.jsonl --output-dir checkpoints/sft
 ```
 
 Outputs: `trajectories/*.jsonl`, `trajectories/summary.csv`, `artifacts/{screenshots,videos,traces}/`, `datasets/sft_turns_{train,val}.jsonl`.
-
-### Remote GPU Setup
-
-```powershell
-# SSH tunnel from local machine to remote model server
-ssh -L 8000:localhost:8000 ubuntu@<REMOTE_IP>
-# If port 8000 is busy locally, use 8001 and set OPENAI_BASE_URL=http://localhost:8001/v1
-```
 
 ---
 
@@ -465,7 +473,7 @@ The project follows a progressive fidelity ladder, where each tier increases the
 
 **Tier 5 insight:** At the VM level, the browser has zero automation artifacts because no automation protocol exists — input is injected at the OS level (xdotool/uinput), and the agent observes via screenshots. This is architecturally equivalent to how some frontier lab's computer-use system operates. It requires switching from DOM-text to vision-based observation (hence Phase 4's VLM upgrade).
 
-**LLM inference latency as a feature:** On a local consumer GPU, the 35B model takes 2–5 seconds per action decision — naturally mapping to human "think time." No artificial delays are needed. The variance in inference time (affected by prompt length, generation length, and GPU load) produces natural-looking timing distributions. On faster cloud hardware (GH200), inference is sub-second, so the environment wrapper adds calibrated random delays (sampled from a log-normal distribution fitted to human interaction timing) during rollout collection to maintain behavioral realism.
+**LLM inference latency as a feature:** On the remote cloud GPU, the 35B model's inference time (affected by prompt length, generation length, and GPU load) produces variable per-action latency. On fast hardware (GH200/H100), inference is sub-second, so the environment wrapper adds calibrated random delays (sampled from a log-normal distribution fitted to human interaction timing) during rollout collection to maintain behavioral realism. The SSH tunnel adds negligible latency (~1ms) since it's just TCP forwarding.
 
 ---
 
@@ -485,39 +493,49 @@ The project follows a progressive fidelity ladder, where each tier increases the
 
 ## Infrastructure
 
-- **Model serving (local):** Qwen 3.5-35B-A3B via vLLM (OpenAI-compatible API, `localhost:8000`), Docker Compose with NVIDIA GPU passthrough. Used for development, prompt iteration, and local inference (~20 GB VRAM). Configurable via `.env` (model, dtype, GPU utilization, tensor parallelism, max model length).
-- **Training compute (cloud):** NVIDIA GH200 (96 GB HBM3) on Lambda Labs. QLoRA fine-tuning of the full 35B MoE model fits in ~35–40 GB, leaving headroom for batch size and sequence length. Rollout collection and training alternate on the same GPU.
-- **Browser automation:** Playwright + Chromium with WebRTC leak prevention (`--force-webrtc-ip-handling-policy=disable_non_proxied_udp`), residential proxy with sticky sessions (configurable via env vars). Creates fresh browser context per episode for state isolation. Runs on a lightweight CPU instance or locally — does not require GPU.
-- **Training stack:** `trl` (SFTTrainer), `peft` (QLoRA with 4-bit NF4 quantization), `transformers`, `accelerate`, `bitsandbytes`; custom trajectory-level GRPO training loop (candidates for replacement: `veRL`, `OpenRLHF`).
+- **Model serving (remote via SSH tunnel):** Qwen 3.5-35B-A3B served via vLLM in Docker on a remote cloud GPU. The local machine connects via SSH tunnel (`ssh -L 8000:localhost:8000 ubuntu@<REMOTE_IP>`), so the OpenAI-compatible API appears at `localhost:8000` locally. The model runs in bfloat16 — no quantization at inference time. Configurable via `.env` (model, dtype, GPU utilization, tensor parallelism, max model length).
+- **Training compute:** Same remote GPU (NVIDIA GH200 96 GB HBM3 or H100 80 GB). LoRA fine-tuning of the full 35B MoE model — training fits on a single GPU. Rollout collection and training alternate on the same GPU.
+- **Browser automation:** Playwright + Chromium with WebRTC leak prevention (`--force-webrtc-ip-handling-policy=disable_non_proxied_udp`), residential proxy with sticky sessions (configurable via env vars). Creates fresh browser context per episode for state isolation. Runs locally — does not require GPU.
+- **Evaluation:** Two-layer system — deterministic failure pattern detectors (instant, zero cost) catch known failure modes like action loops, wait cascades, and observation-unchanged stalls; LLM-as-judge scores trajectories against 10 weighted criteria (goal achievement, efficiency, action quality, resilience, comprehension). The judge can use the same model server or a stronger external model.
+- **Training stack:** `trl` (SFTTrainer), `peft` (QLoRA — 4-bit NF4 quantization via `unsloth` + LoRA adapters), `transformers`, `accelerate`; custom trajectory-level GRPO training loop (candidates for replacement: `veRL`, `OpenRLHF`).
 - **Core dependencies:** `playwright`, `openai` (Python client), `python-dotenv`, `pydantic`. Phase 2 deps (trl, transformers, etc.) installed separately.
 - **Cost estimate:** GH200 on Lambda ≈ $2–3/hr. SFT (a few hours) + RL (tens of hours over multiple sessions) ≈ $50–150 total training compute.
 
 ### Model serving notes
 
+- Model runs in `bfloat16` on Ampere+ GPUs (no quantization at inference)
 - `MAX_MODEL_LEN=32768` (reduce if VRAM-constrained)
-- `GPU_MEMORY_UTILIZATION=0.95` (lower if sharing GPU)
+- `GPU_MEMORY_UTILIZATION=0.92` (lower if sharing GPU)
 - `TENSOR_PARALLEL_SIZE` = number of GPUs
-- Tool calling: `--enable-auto-tool-choice --tool-call-parser hermes`
+- Reasoning: `--reasoning-parser qwen3`
+- Tool calling: `--enable-auto-tool-choice --tool-call-parser qwen3_coder`
+- `--language-model-only` (multi-modal model served as language model, allows for bringing in vision later with less overhead)
 
 ### Prerequisites
 
-- NVIDIA GPU (GH200 / A100 / H100 recommended), Docker with GPU support
-- Python 3.11+, Hugging Face token with model access
+- Remote NVIDIA GPU (GH200 / A100 / H100) with Docker and GPU support, accessible via SSH
+- Local machine: Python 3.11+, Hugging Face token with model access
 
 ---
 
 ## Current Status
 
 Phase 1 (demonstration collection) is **implemented and operational**:
-- The vLLM serving infrastructure is running via Docker Compose.
+- The vLLM serving infrastructure runs via Docker Compose on a remote cloud GPU, accessed locally via SSH tunnel.
 - The browser environment wrapper exposes a Gym-style `reset()`/`step()` API with DOM-text observations.
 - The agent loop collects trajectories with universal recovery logic and no site-specific heuristics.
 - The declarative task system supports Reddit signup; new platforms are added by subclassing `WebTask`.
 - Trajectory collection produces JSONL files with task metadata headers and a summary CSV.
 - Platform-specific research (detection stacks, DOM structures, verification flows) is complete for Reddit, X, LinkedIn, etc.
 
+**Trajectory evaluation is implemented:**
+- 12 deterministic failure pattern detectors (action loops, wait cascades, parse error spikes, observation-unchanged stalls, etc.) for instant, zero-cost trajectory triage.
+- 10-criterion LLM-as-judge scoring system with weighted 1-5 rubrics covering task completion, efficiency, action quality, resilience, and comprehension.
+- CLI: `python -m evals.run` supports `--patterns-only`, `--failure-only`, `--judge-model`, `--list-patterns`, with JSON/CSV export.
+- Cursor rules ensure future agent sessions automatically know the eval conventions and the workflow for adding new patterns when debugging failures.
+
 Phase 2 (SFT) tooling is **implemented**:
 - SFT data preparation filters heuristic actions, reads task metadata from trajectories, and builds train/val splits.
-- QLoRA fine-tuning script uses TRL SFTTrainer with configurable LoRA rank/alpha and 4-bit quantization.
+- QLoRA fine-tuning script uses TRL SFTTrainer with configurable LoRA rank/alpha.
 
-**Immediate next steps:** Collect a sufficient corpus of successful trajectories for SFT warm-start, run SFT on a cloud GH200, and begin iterating toward the GRPO training phase.
+**Immediate next steps:** Collect a sufficient corpus of successful trajectories for SFT warm-start using the 122B model, run SFT on the remote GPU, and begin iterating toward the GRPO training phase.
