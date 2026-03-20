@@ -1,4 +1,4 @@
-# Note that this is all still a work in progress. A lot of things may change as I go along making this.
+## Note that this is all still a work in progress. Things will change as I go along making this. I am currently facing a major blocker with gpu availability on cloud services, so this project is going a lot slower than anticipated.
 
 ## Project Overview & Motivation
 
@@ -10,13 +10,13 @@ The work is motivated by persistent disinformation campaigns across domains such
 
 Web signup and onboarding flows are among the most adversarial interactive environments available today: they combine non-stationary page layouts, multi-step verification gates, invisible behavioral scoring, and sophisticated fingerprinting — all designed to distinguish humans from automated agents. This makes them a compelling testbed for training robust, generalizable computer-use agents via reinforcement learning.
 
-This project trains an LLM — Qwen 3.5-35B-A3B (MoE, 3B active parameters) — to complete real web tasks by learning a policy that maps page observations to browser actions. The model is served via vLLM on a remote cloud GPU (accessed locally through an SSH tunnel to `localhost:8000`), and fine-tuned on the same hardware via QLoRA. A stronger same-family teacher model (Qwen3.5-122B-A10B) generates seed demonstrations, and an LLM-as-judge (most likely going to be gpt or claude) evaluation system scores trajectory quality. The agent improves through a **teacher demonstrations → supervised fine-tuning → GRPO reinforcement learning** pipeline, with reward signals derived from task completion, intermediate progress, and behavioral realism.
+This project trains an LLM — Qwen 3.5-35B-A3B (MoE, 3B active parameters) — to complete real web tasks by learning a policy that maps page observations to browser actions. The model is served via vLLM on a remote cloud GPU (accessed locally through an SSH tunnel to `localhost:8000`), and fine-tuned on the same hardware via LoRA. A stronger same-family teacher model (Qwen3.5-122B-A10B) generates seed demonstrations, and an LLM-as-judge (most likely going to be gpt or claude) evaluation system scores trajectory quality before SFT to ensure data quality. The agent improves through a **teacher demonstrations → supervised fine-tuning → GRPO reinforcement learning** pipeline, with reward signals derived from task completion, intermediate progress, and behavioral realism.
 
 ### What makes this technically interesting
 
 - **Sparse, delayed rewards in a long-horizon task.** A signup flow is 10–30 steps. The terminal reward (account created) is binary and only observed at the end. Intermediate shaping signals must be designed carefully to avoid reward hacking.
 - **Adversarial, non-stationary environment.** Detection systems retrain continuously; page layouts change; challenge frequency is conditioned on the agent's own behavioral history within a session. The environment is not an offline dataset — it fights back.
-- **Real-world grounding with no simulator.** Unlike Atari or MuJoCo, there is no reset-to-identical-state. Each episode runs against a live website with server-side state, rate limits, and IP reputation. Exploration is expensive.
+- **Real-world grounding with no simulator.** There is no reset-to-identical-state. Each episode runs against a live environment with server-side state, rate limits, and IP reputation. Exploration is expensive.
 - **Cross-signal consistency constraints.** The agent operates within a high-dimensional identity envelope (browser fingerprint, network origin, behavioral cadence, session history) where any single inconsistency across signals can invalidate the entire episode.
 
 ---
@@ -166,9 +166,7 @@ FUTURE_ACTIONS = [
     "request_sms_code",     # signals the Verification Oracle
 ]
 ```
-
-Actions are emitted as structured JSON by the LLM and parsed deterministically. The agent first attempts tool-call mode (if supported by the model server), then falls back to JSON response format, then raw text extraction. On parse failure, the agent retries once with a stricter format prompt before falling back to `wait(1.0)`. The action space is intentionally narrow — the agent must compose complex behaviors from primitive actions, which is where the RL signal provides value.
-
+Actions are emitted as structured JSON by the LLM and parsed deterministically, so structural integrity is important.
 ---
 
 ## Reward Design
@@ -184,13 +182,11 @@ Reward shaping is critical because the terminal signal (account created or not) 
 | **Account created successfully** | **+1.0** | Success page URL, confirmation text, or API check |
 | Timed out / max steps exceeded | 0.0 | Episode truncation |
 | Action executed too fast (< 500ms gap) | −0.1 | Timing check in environment wrapper |
-| Click dead-center on element | −0.05 | Coordinate offset analysis |
-| CAPTCHA triggered | −0.05 | CAPTCHA iframe/element detected in DOM |
 | Efficiency bonus | +0.2 × (1 − steps/max_steps) | Fewer steps = higher bonus |
 
 **Implementation note:** The reward tracker (`browser_env/reward.py`) currently implements the milestone-based subset: target page detection (+0.3), per-field fill detection via `form_data` keys (+0.1 each), CAPTCHA penalty (−0.05), and success bonus (+1.0). The behavioral penalties (timing, click centering, efficiency) are designed for Phase 3 RL and will be added when the GRPO training loop is built.
 
-**Design rationale:** Negative rewards for bot-like micro-behaviors incentivize the policy to learn human-plausible interaction patterns — not as hardcoded heuristics, but as emergent behavior shaped by the reward landscape. The agent should discover that browsing before signing up reduces CAPTCHA frequency, that variable typing speed avoids keystroke analysis flags, and that non-centered clicks avoid heatmap detection — all through trial-and-error RL.
+**Design rationale:** Negative rewards for bot-like micro-behaviors incentivize the policy to learn human-plausible interaction patterns — not as hardcoded heuristics, but as emergent behavior shaped by the reward landscape. For instance, The agent should implicitly discover that browsing before signing up reduces CAPTCHA frequency through trial-and-error RL.
 
 ---
 
@@ -202,7 +198,7 @@ The pipeline has three phases. The current approach uses **same-family distillat
 
 **Teacher model selection:** Same-family distillation works best — the teacher and student share the same tokenizer and reasoning style, so demonstrations transfer more cleanly.
 
-| Teacher | Active params | VRAM (bf16 -> Q4) | Notes |
+| Teacher | Active params | VRAM (Int4) | Notes |
 |---|---|---|---|
 | **Qwen3.5-122B-A10B** | 10B | fits on 1x H100 80 GB or 1x GH200 (96 GB HBM3) | Best practical choice: strong enough for quality demos, serveable on a single GPU, concerns around context length |
 | Qwen3.5-397B-A17B | 17B | 100GB+ — needs multiple GPUs | Stronger but much harder to serve; diminishing returns for behavioral cloning |
@@ -398,10 +394,11 @@ The project follows a progressive fidelity ladder, where each tier increases the
 ## Infrastructure
 
 - **Model serving (remote via SSH tunnel):** Qwen 3.5-35B-A3B served via vLLM in Docker on a remote cloud GPU. The local machine connects via SSH tunnel (`ssh -L 8000:localhost:8000 ubuntu@<REMOTE_IP>`), so the OpenAI-compatible API appears at `localhost:8000` locally. The model runs in bfloat16 — no quantization at inference time. Configurable via `.env` (model, dtype, GPU utilization, tensor parallelism, max model length).
-- **Training compute:** Same remote GPU (NVIDIA GH200 96 GB HBM3 or H100 80 GB). LoRA fine-tuning of the full 35B MoE model — training fits on a single GPU. Rollout collection and training alternate on the same GPU.
+- **Training compute:** Same remote GPU (NVIDIA GH200 96 GB HBM3 or H100 80 GB). LoRA fine-tuning of the 35B MoE model — training fits on a single GPU. Rollout collection and training alternate on the same GPU.
+Potential concern: MoE sensitivity to LoRA/finetuning
 - **Browser automation:** Playwright + Chromium with WebRTC leak prevention (`--force-webrtc-ip-handling-policy=disable_non_proxied_udp`), residential proxy with sticky sessions (configurable via env vars). Creates fresh browser context per episode for state isolation. Runs locally — does not require GPU.
-- **Evaluation:** Two-layer system — deterministic failure pattern detectors (instant, zero cost) catch known failure modes like action loops, wait cascades, and observation-unchanged stalls; LLM-as-judge scores trajectories against 10 weighted criteria (goal achievement, efficiency, action quality, resilience, comprehension). The judge can use the same model server or a stronger external model.
-- **Training stack:** `trl` (SFTTrainer), `peft` (QLoRA — 4-bit NF4 quantization via `unsloth` + LoRA adapters), `transformers`, `accelerate`; custom trajectory-level GRPO training loop (candidates for replacement: `veRL`, `OpenRLHF`).
+- **Evaluation:** Two-layer system — deterministic failure pattern detectors (instant, zero cost) catch known failure modes like action loops, wait cascades, and observation-unchanged stalls; LLM-as-judge scores trajectories against 10 weighted criteria (goal achievement, efficiency, action quality, resilience, comprehension).
+- **Training stack:** `trl` (SFTTrainer), `unsloth` (peft/LoRA via unsloth), `transformers`, `accelerate`; custom trajectory-level GRPO training loop (candidates for replacement: `veRL`, `OpenRLHF`).
 - **Core dependencies:** `playwright`, `openai` (Python client), `python-dotenv`, `pydantic`. Phase 2 deps (trl, transformers, etc.) installed separately.
 - **Cost estimate:** GH200 on Lambda ≈ $2–3/hr. SFT (a few hours) + RL (tens of hours over multiple sessions) ≈ $50–150 total training compute.
 
@@ -427,4 +424,4 @@ Phase 2 (SFT) tooling is **implemented**:
 - SFT data preparation filters heuristic actions, reads task metadata from trajectories, and builds train/val splits.
 - QLoRA fine-tuning script uses TRL SFTTrainer with configurable LoRA rank/alpha.
 
-**Immediate next steps:** Collect a sufficient corpus of successful trajectories for SFT warm-start using the 122B model, run SFT on the remote GPU, and begin iterating toward the GRPO training phase.
+**Immediate next steps:** Collect a sufficient corpus of successful trajectories for SFT warm-start using the 122B model (https://huggingface.co/Qwen/Qwen3.5-122B-A10B-GPTQ-Int4), run SFT on the remote GPU, and begin iterating toward the GRPO training phase.
