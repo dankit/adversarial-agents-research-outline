@@ -1,5 +1,3 @@
-## Note that this is all still a work in progress. Things will change as I go along making this. I am currently facing a major blocker with gpu availability on cloud services, so this project is going slower than anticipated.
-
 ## Project Overview & Motivation
 
 This project maps the threat landscape of AI-enabled manipulation across major social media platforms. It studies coordinated inauthentic behavior, including bot-driven narratives and mass upvote/downvote campaigns that exploit platform mechanics and human cognitive biases at scale.
@@ -70,52 +68,6 @@ This means new sites need zero Python heuristic code — just a declarative task
 
 ---
 
-## Project Structure
-
-```
-root/
-├── docker-compose.yml              # vLLM model server (Qwen3.5-35B-A3B)
-├── .env.example                    # Environment variable template
-├── requirements.txt                # Core deps: playwright, openai, python-dotenv, pydantic
-├── README.md                       # Project-level docs, quick start, adding tasks
-├── AGENT_QUICKREF.md               # Operational reference: architecture, action contract, how to run
-├── PLAN.md                         # Full project plan: phases, RL design, bot detection, proxy/email setup
-│
-├── agent/                          # Agent loop and LLM integration
-│   ├── agent.py                    # Episode loop: observe → think → act → log; universal recovery
-│   ├── llm_client.py               # OpenAI-compatible vLLM client; think-tag stripping; tool call support
-│   └── prompts.py                  # build_system_prompt(objective, form_data) with observation format docs
-│
-├── browser_env/                    # Playwright browser environment
-│   ├── environment.py              # Gym-like reset/step API; observation extraction; action execution
-│   └── reward.py                   # Milestone-based reward shaping with per-field detection via form_data keys
-│
-├── tasks/                          # Declarative task definitions
-│   ├── base.py                     # WebTask base class (objective, form_data, success signals, captcha keywords)
-│   └── example_signup.py           # example signup task for website A (inherits WebTask)
-│
-├── training/                       # Trajectory collection and training pipeline
-│   ├── collect.py                  # Multi-episode trajectory collector with task registry
-│   ├── prepare_sft.py              # Filter heuristic actions, build SFT train/val splits from trajectories
-│   ├── sft.py                      # LoRA fine-tuning with TRL SFTTrainer
-│   └── replay_artifacts.py         # Locate/open latest screenshots, videos, traces
-│
-├── evals/                          # Two-layer trajectory evaluation system
-│   ├── patterns.py                 # 12 deterministic failure pattern detectors (instant, zero LLM cost)
-│   ├── criteria.py                 # 10 LLM-as-judge criteria with 1-5 rubrics
-│   ├── judge.py                    # LLM-as-judge trajectory scoring (summarizes + prompts judge model)
-│   └── run.py                      # CLI: python -m evals.run (patterns-only or full judge)
-│
-├── trajectories/                   # Collected episode data (generated at runtime)
-│   ├── summary.csv                 # Episode-level metrics (reward, success, steps)
-│   └── <episode_id>.jsonl          # Per-episode transitions with task metadata header
-│
-└── artifacts/                      # Runtime artifacts (generated at runtime)
-    ├── screenshots/                # Per-step screenshots
-    ├── videos/                     # Playwright session videos
-    └── traces/                     # Per-episode Playwright traces (.zip)
-```
-
 ## Observation and Action Design
 
 ### Observation strategy
@@ -137,8 +89,6 @@ ELEMENTS:
 - id=3 role=button label=Sign Up filled=false enabled=true
 - id=4 role=a label=Already have an account? filled=false enabled=true
 ```
-
-Elements are extracted via JavaScript, prioritized (form inputs first, then buttons, then links), and capped at 40 per observation. Each element is tagged with a stable `data-wa-oid` attribute on the page so the agent's `id=N` targets resolve deterministically to the correct DOM element.
 
 ### Action space (implemented)
 
@@ -202,7 +152,7 @@ The pipeline has three phases. The current approach uses **same-family distillat
 
 ~~Prefer **Qwen3.5-122B-A10B** — it's the sweet spot between demonstration quality and serving cost. The student only sees actions, not logits, so the marginal quality gain from 397B rarely justifies 3x the hardware.~~
 
-Due to limited gpu capability, I have switched to a managed service for hosting qwen 3.5 397B A17B on mulerouter/alibaba.
+Due to limited gpu capability, I have switched to a managed service for hosting qwen 3.5 397B A17B.
 
 
 ### Phase 1 — Demonstration collection (implemented)
@@ -293,44 +243,6 @@ Train on multiple platforms with random task sampling per episode. Evaluate on h
 
 ---
 
-## Quick Start
-
-```powershell
-# 1. Install (local machine)
-python -m venv .venv && .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt && playwright install chromium
-
-# 2. Configure
-copy .env.example .env   # edit HF_TOKEN, TENSOR_PARALLEL_SIZE, proxy settings
-
-# 3. SSH tunnel to remote model server (separate terminal)
-ssh -L 8000:localhost:8000 ubuntu@<REMOTE_IP>
-# If port 8000 is busy locally, use 8001 and set OPENAI_BASE_URL=http://localhost:8001/v1
-
-# 4. Start model server (on remote GPU machine)
-docker compose up -d
-docker compose logs -f qwen   # wait for "Uvicorn running on ..."
-
-# 5. Collect trajectories (local machine, browser runs locally)
-python -m training.collect --task website_signup --episodes 5 --max-steps 40
-python -m training.collect --task website_signup --episodes 1 --watch --verbose-actions  # visible browser
-
-# 6. Evaluate collected trajectories (instant, no LLM needed)
-python -m evals.run --patterns-only
-
-# 7. Full eval with LLM-as-judge
-python -m evals.run --output-json evals_report.json
-
-# 8. Prepare SFT data (reads objective + form_data from trajectory metadata)
-python -m training.prepare_sft --success-only
-
-# 9. Fine-tune (on remote GPU)
-python -m training.sft --dataset datasets/sft_turns_train.jsonl --output-dir checkpoints/sft
-```
-
-Outputs: `trajectories/*.jsonl`, `trajectories/summary.csv`, `artifacts/{screenshots,videos,traces}/`, `datasets/sft_turns_{train,val}.jsonl`.
-
----
 
 ## Infrastructure
 
@@ -341,31 +253,13 @@ Potential concern: MoE sensitivity to LoRA/finetuning
 - **Evaluation:** Two-layer system — deterministic failure pattern detectors (instant, zero cost) catch known failure modes like action loops, wait cascades, and observation-unchanged stalls; LLM-as-judge scores trajectories against 10 weighted criteria (goal achievement, efficiency, action quality, resilience, comprehension).
 - **Training stack:** `trl` (SFTTrainer), `unsloth` (for peft/LoRA), `transformers`, `accelerate`; custom trajectory-level GRPO training loop (candidates for replacement: `veRL`, `OpenRLHF`).
 - **Core dependencies:** `playwright`, `openai` (Python client), `python-dotenv`, `pydantic`. Phase 2 deps (trl, transformers, etc.) installed separately.
-- **Cost estimate:** GH200 on Lambda ≈ $2–3/hr. SFT (a few hours) + RL (tens of hours over multiple sessions) ≈ $50–150 total training compute.
+- **Cost estimate:** GH200 on Lambda ≈ $2–3/hr. SFT (a few hours) + RL (tens of hours over multiple sessions) ≈ $50–150 total training compute. For trajectory collection, add another $50 with the 397B model.
 
 ---
 
 ## Current Status
 
-Phase 1 (demonstration collection) is **implemented and operational**:
-- The vLLM serving infrastructure runs via Docker Compose on a remote cloud GPU, accessed locally via SSH tunnel.
-- The browser environment wrapper exposes a Gym-style `reset()`/`step()` API with DOM-text observations.
-- The agent loop collects trajectories with universal recovery logic and no site-specific heuristics.
-- The declarative task system supports a simple web signup; new platforms are added by subclassing `WebTask`.
-- Trajectory collection produces JSONL files with task metadata headers and a summary CSV.
-- Platform-specific research (detection stacks, DOM structures, verification flows) is complete.
-
-**Trajectory evaluation is implemented:**
-- 12 deterministic failure pattern detectors (action loops, wait cascades, parse error spikes, observation-unchanged stalls, etc.) for instant, zero-cost trajectory triage.
-- 10-criterion LLM-as-judge scoring system with weighted 1-5 rubrics covering task completion, efficiency, action quality, resilience, and comprehension.
-- CLI: `python -m evals.run` supports `--patterns-only`, `--failure-only`, `--judge-model`, `--list-patterns`, with JSON/CSV export.
-- Cursor rules ensure future agent sessions automatically know the eval conventions and the workflow for adding new patterns when debugging failures.
-
-Phase 2 (SFT) tooling is **implemented**:
-- SFT data preparation filters heuristic actions, reads task metadata from trajectories, and builds train/val splits.
-- LoRA fine-tuning script uses TRL SFTTrainer with configurable LoRA rank/alpha.
-
-**Immediate next steps:** Collect a sufficient corpus of successful trajectories for SFT warm-start using the 397B model, run SFT on the remote GPU, and begin iterating toward the GRPO training phase.
+**Immediate next steps:** Collect a sufficient corpus of successful trajectories for SFT warm-start using the 397B model, run SFT on the remote GPU, and begin iterating toward the GRPO training phase. This step required building a harness around playwright that the teacher model can interact with, along with the student. Currently gathering trajectories for 5+ different domains with multiple actions/operations within each domain (signup, commenting, voting, etc).
 
 
 Misc notes:
